@@ -1,12 +1,76 @@
 """
-Dashboard web, optimizat pentru telefon. Ruleaza in acelasi proces cu
-botul (vezi app.py) si doar citeste din state.bot_state.
+Server web cu doua roluri:
+1. /webhook -- primeste alerta de la TradingView (Pine Script), verifica
+   codul secret, si plaseaza ordinul la Tradovate (Market + Stop + Limit).
+2. / -- dashboard mobil-friendly, ca sa vezi ce a facut botul.
+
+Codul secret trebuie sa fie IDENTIC in doua locuri:
+- in setarile strategiei din TradingView (input-ul "Cod secret webhook")
+- in variabila de mediu WEBHOOK_SECRET, pe Railway
 """
 
-from flask import Flask, jsonify, render_template_string
+import os
+from datetime import datetime, timezone
+
+from flask import Flask, jsonify, render_template_string, request
+
 from state import bot_state
+from broker_manager import get_broker
 
 app = Flask(__name__)
+
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "SCHIMBA-MA")
+QTY = int(os.environ.get("TRADE_QTY", "1"))
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"error": "payload invalid sau lipsă"}), 400
+
+    if data.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "cod secret greșit"}), 403
+
+    direction = data.get("direction")
+    symbol = data.get("symbol")
+    entry = data.get("entry")
+    sl = data.get("sl")
+    tp = data.get("tp")
+
+    if direction not in ("SHORT", "LONG") or not symbol or sl is None or tp is None:
+        return jsonify({"error": "câmpuri lipsă în payload"}), 400
+
+    bot_state.update(last_webhook_at=datetime.now(timezone.utc))
+
+    broker = get_broker()
+    if broker is None:
+        bot_state.add_trade({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "direction": direction, "entry_price": entry, "stop_loss": sl,
+            "take_profit": tp, "status": "EȘUAT - bot neconectat la broker",
+        })
+        return jsonify({"error": "botul nu e conectat la broker în acest moment"}), 503
+
+    action = "Sell" if direction == "SHORT" else "Buy"
+    opposite = "Buy" if direction == "SHORT" else "Sell"
+
+    try:
+        broker.place_market_order(symbol, action, QTY)
+        broker.place_stop_order(symbol, opposite, QTY, sl)
+        broker.place_limit_order(symbol, opposite, QTY, tp)
+        status = "EXECUTAT"
+    except Exception as e:
+        status = f"EROARE: {e}"
+
+    bot_state.add_trade({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "direction": direction, "entry_price": entry, "stop_loss": sl,
+        "take_profit": tp, "status": status,
+    })
+
+    return jsonify({"status": status})
+
 
 PAGE = """
 <!DOCTYPE html>
@@ -39,18 +103,10 @@ PAGE = """
   <div class="sub" id="lastUpdate">se încarcă...</div>
 
   <div class="card">
-    <div class="row"><span class="label">Status conexiune</span>
+    <div class="row"><span class="label">Status conexiune broker</span>
       <span class="value" id="connStatus">-</span></div>
     <div class="row"><span class="label">Cont</span><span class="value" id="account">-</span></div>
-    <div class="row"><span class="label">Direcție configurată</span><span class="value" id="direction">-</span></div>
-    <div class="row"><span class="label">Ultimul preț</span><span class="value" id="lastPrice">-</span></div>
-  </div>
-
-  <div class="card">
-    <div class="row"><span class="label">Range High</span><span class="value" id="rangeHigh">-</span></div>
-    <div class="row"><span class="label">Range Low</span><span class="value" id="rangeLow">-</span></div>
-    <div class="row"><span class="label">Range gata</span><span class="value" id="rangeReady">-</span></div>
-    <div class="row"><span class="label">Tranzacționat azi</span><span class="value" id="tradedToday">-</span></div>
+    <div class="row"><span class="label">Ultimul webhook primit</span><span class="value" id="lastWebhook">-</span></div>
   </div>
 
   <h2 style="font-size:1rem; margin-top:20px;">Istoric tranzacții</h2>
@@ -70,19 +126,15 @@ async function refresh() {
                              : '<span class="dot red"></span>Deconectat';
     document.getElementById('connStatus').innerHTML = dot;
     document.getElementById('account').textContent = d.account_name || '-';
-    document.getElementById('direction').textContent = d.direction || '-';
-    document.getElementById('lastPrice').textContent = d.last_price ?? '-';
-    document.getElementById('rangeHigh').textContent = d.range_high ?? '-';
-    document.getElementById('rangeLow').textContent = d.range_low ?? '-';
-    document.getElementById('rangeReady').textContent = d.range_ready ? 'Da' : 'Nu';
-    document.getElementById('tradedToday').textContent = d.traded_today ? 'Da' : 'Nu';
+    document.getElementById('lastWebhook').textContent = d.last_webhook_at
+      ? new Date(d.last_webhook_at).toLocaleString('ro-RO') : 'Niciunul încă';
 
     const log = document.getElementById('tradeLog');
     if (d.trade_log && d.trade_log.length) {
       log.innerHTML = d.trade_log.map(t => `
         <div class="trade ${t.direction === 'SHORT' ? 'short' : 'long'}">
           <b>${t.direction}</b> @ ${t.entry_price} &middot; SL ${t.stop_loss} / TP ${t.take_profit}
-          <div style="color:#999; font-size:0.8rem;">${new Date(t.ts).toLocaleString('ro-RO')}</div>
+          <div style="color:#999; font-size:0.8rem;">${t.status || ''} &middot; ${new Date(t.ts).toLocaleString('ro-RO')}</div>
         </div>`).join('');
     } else {
       log.innerHTML = '<div class="empty">Niciun semnal încă</div>';

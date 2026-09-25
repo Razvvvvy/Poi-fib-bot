@@ -1,6 +1,6 @@
 """
-Starea botului, impartita intre bucla de trading (thread de fundal) si
-dashboard-ul web (care doar citeste starea ca sa o afiseze).
+Starea botului, impartita intre broker_manager (conexiunea la
+Tradovate) si dashboard.py (webhook + pagina web).
 """
 
 import threading
@@ -13,12 +13,7 @@ class BotState:
         self.connected = False
         self.account_name = None
         self.last_update = None
-        self.range_high = None
-        self.range_low = None
-        self.range_ready = False
-        self.traded_today = False
-        self.direction = None
-        self.last_price = None
+        self.last_webhook_at = None
         self.trade_log = []  # listă de dict-uri, cele mai recente primele
         self.last_error = None
 
@@ -39,12 +34,7 @@ class BotState:
                 "connected": self.connected,
                 "account_name": self.account_name,
                 "last_update": self.last_update.isoformat() if self.last_update else None,
-                "range_high": self.range_high,
-                "range_low": self.range_low,
-                "range_ready": self.range_ready,
-                "traded_today": self.traded_today,
-                "direction": self.direction,
-                "last_price": self.last_price,
+                "last_webhook_at": self.last_webhook_at.isoformat() if self.last_webhook_at else None,
                 "trade_log": self.trade_log,
                 "last_error": self.last_error,
             }

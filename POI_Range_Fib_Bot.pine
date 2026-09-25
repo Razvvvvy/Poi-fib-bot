@@ -1,0 +1,190 @@
+//@version=6
+strategy("POI Range Fib Bot - ES/NQ", overlay=true,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     initial_capital=50000, commission_type=strategy.commission.cash_per_contract,
+     commission_value=0, process_orders_on_close=true, calc_on_every_tick=true,
+     max_boxes_count=50, max_lines_count=50, max_labels_count=50, max_polylines_count=50)
+
+// =====================================================================================
+// INPUTS
+// =====================================================================================
+grpRange = "Range 6:00-9:00"
+i_tz          = input.string("America/New_York", "Fus orar sesiune", group=grpRange)
+i_rangeStart  = input.session("0900-1200", "Interval formare range (high/low)", group=grpRange)
+i_tradeStart  = input.session("1330-1645", "Interval permis pentru intrare", group=grpRange)
+
+grpDir = "Direcție & Risc"
+i_dir   = input.string("Short", "Direcție (manual, deocamdată)", options=["Short", "Long"], group=grpDir)
+i_sl    = input.float(300, "Stop Loss (puncte preț)", minval=1, group=grpDir)
+i_tpMul = input.float(5.0, "Take Profit = SL x", minval=0.1, group=grpDir)
+i_webhookSecret = input.string("SCHIMBA-MA", "Cod secret webhook (pune-l si pe Railway)", group=grpDir)
+
+grpCircle = "Fibonacci Circles (vizual + filtru)"
+i_useCircleFilter = input.bool(true, "Cere confirmare din zona gri a cercului (0.5-1.0)", group=grpCircle)
+i_showCircles = input.bool(true, "Arată cercurile Fibonacci pe grafic", group=grpCircle)
+i_pxPerBar    = input.float(1.0, "Scalare vizuală cerc (ajustează dacă cercul arată turtit/alungit)", minval=0.01, group=grpCircle)
+
+grpViz = "Vizual"
+i_showFib = input.bool(true, "Arată nivelurile Fibonacci orizontale", group=grpViz)
+
+// =====================================================================================
+// SESSION / RANGE TRACKING
+// =====================================================================================
+inRangeWindow = not na(time(timeframe.period, i_rangeStart, i_tz))
+inTradeWindow = not na(time(timeframe.period, i_tradeStart, i_tz))
+isNewDay      = dayofmonth(time, i_tz) != dayofmonth(time[1], i_tz)
+
+var float rangeHigh     = na
+var float rangeLow      = na
+var int   rangeHighTime = na
+var int   rangeLowTime  = na
+var bool  rangeReady    = false
+var bool  tradedToday   = false
+
+// box/label handles so we can clean up drawings each day
+var box   zoneShortBox = na
+var box   zoneLongBox  = na
+var line  l0 = na
+var line  l05 = na
+var line  l1 = na
+var polyline[] circlePolys = array.new<polyline>()
+
+f_clearCircles() =>
+    if array.size(circlePolys) > 0
+        for p in circlePolys
+            polyline.delete(p)
+        array.clear(circlePolys)
+
+if isNewDay
+    rangeHigh := na
+    rangeLow := na
+    rangeHighTime := na
+    rangeLowTime := na
+    rangeReady := false
+    tradedToday := false
+    box.delete(zoneShortBox)
+    box.delete(zoneLongBox)
+    line.delete(l0)
+    line.delete(l05)
+    line.delete(l1)
+    f_clearCircles()
+
+if inRangeWindow
+    if na(rangeHigh) or high > rangeHigh
+        rangeHigh := high
+        rangeHighTime := time
+    if na(rangeLow) or low < rangeLow
+        rangeLow := low
+        rangeLowTime := time
+
+// range devine "blocat" în prima bară de după fereastra 6:00-9:00
+if not inRangeWindow and not na(rangeHigh) and not rangeReady
+    rangeReady := true
+
+// =====================================================================================
+// NIVELURI FIBONACCI (orizontale)
+// =====================================================================================
+level0  = rangeLow
+level1  = rangeHigh
+level05 = na(rangeHigh) or na(rangeLow) ? na : (level0 + level1) / 2
+rng     = na(rangeHigh) or na(rangeLow) ? na : (rangeHigh - rangeLow)
+
+zoneShortLow  = level05
+zoneShortHigh = level1
+zoneLongLow   = level0
+zoneLongHigh  = level05
+
+// =====================================================================================
+// FIBONACCI CIRCLE - centru = punctul (high sau low) format PRIMUL cronologic
+// banda gri = 0.5R - 1.0R distanță de la centru (aproximare doar pe axa de preț)
+// =====================================================================================
+circleAnchorIsHigh = rangeHighTime < rangeLowTime
+circleAnchorPrice  = circleAnchorIsHigh ? rangeHigh : rangeLow
+circleAnchorBar    = circleAnchorIsHigh ? rangeHighTime : rangeLowTime
+
+grayUpperLow  = na(rng) ? na : circleAnchorPrice + 0.5 * rng
+grayUpperHigh = na(rng) ? na : circleAnchorPrice + 1.0 * rng
+grayLowerLow  = na(rng) ? na : circleAnchorPrice - 1.0 * rng
+grayLowerHigh = na(rng) ? na : circleAnchorPrice - 0.5 * rng
+
+// =====================================================================================
+// DESEN: linii fib + zone colorate (o singură dată, când range-ul devine "ready")
+// =====================================================================================
+justBecameReady = rangeReady and not rangeReady[1]
+
+if justBecameReady and i_showFib
+    l0  := line.new(bar_index, level0, bar_index + 200, level0, color=color.purple, style=line.style_dashed)
+    l05 := line.new(bar_index, level05, bar_index + 200, level05, color=color.black, style=line.style_solid)
+    l1  := line.new(bar_index, level1, bar_index + 200, level1, color=color.purple, style=line.style_dashed)
+    zoneShortBox := box.new(bar_index, zoneShortHigh, bar_index + 200, zoneShortLow, border_color=na, bgcolor=color.new(color.red, 85))
+    zoneLongBox  := box.new(bar_index, zoneLongHigh, bar_index + 200, zoneLongLow, border_color=na, bgcolor=color.new(color.green, 85))
+
+// extinde liniile/zonele pe măsură ce trece timpul, cât suntem în aceeași zi
+if rangeReady and i_showFib
+    line.set_x2(l0, bar_index + 5)
+    line.set_x2(l05, bar_index + 5)
+    line.set_x2(l1, bar_index + 5)
+    box.set_right(zoneShortBox, bar_index + 5)
+    box.set_right(zoneLongBox, bar_index + 5)
+
+// --- cercuri Fibonacci (best-effort, doar vizual) ---
+f_drawCircle(centerBar, centerPrice, radiusPrice, col, steps) =>
+    pts = array.new<chart.point>()
+    for i = 0 to steps
+        ang = 2 * math.pi * i / steps
+        px = int(centerBar + math.round(radiusPrice / i_pxPerBar * math.cos(ang)))
+        py = centerPrice + radiusPrice * math.sin(ang)
+        array.push(pts, chart.point.from_index(px, py))
+    p = polyline.new(pts, curved=false, closed=true, line_color=col, line_width=1)
+    array.push(circlePolys, p)
+
+if justBecameReady and i_showCircles and not na(rng)
+    fibRatios = array.from(0.382, 0.5, 0.618, 0.786, 1.0)
+    for r in fibRatios
+        colr = r >= 0.5 and r <= 1.0 ? color.new(color.gray, 40) : color.new(color.blue, 70)
+        f_drawCircle(circleAnchorBar, circleAnchorPrice, rng * r, colr, 80)
+
+// =====================================================================================
+// LOGICA DE INTRARE
+// =====================================================================================
+shortZoneTouch   = not na(zoneShortLow) and high >= zoneShortLow and low <= zoneShortHigh
+longZoneTouch    = not na(zoneLongLow)  and low  <= zoneLongHigh and high >= zoneLongLow
+
+shortCircleTouch = not i_useCircleFilter or (not na(grayUpperLow) and high >= grayUpperLow and low <= grayUpperHigh)
+longCircleTouch  = not i_useCircleFilter or (not na(grayLowerLow) and low  <= grayLowerHigh and high >= grayLowerLow)
+
+canTrade = rangeReady and inTradeWindow and not tradedToday and not na(rangeHigh) and not na(rangeLow)
+
+goShort = canTrade and i_dir == "Short" and shortZoneTouch and shortCircleTouch
+goLong  = canTrade and i_dir == "Long"  and longZoneTouch  and longCircleTouch
+
+// =====================================================================================
+// EXECUȚIE (SL/TP fixe, în puncte de preț - verifică dacă instrumentul tău le citește la fel)
+// =====================================================================================
+if goShort
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Exit Short", "Short", stop = close + i_sl, limit = close - i_sl * i_tpMul)
+    tradedToday := true
+    label.new(bar_index, high, "SHORT\nSL " + str.tostring(i_sl) + " / TP " + str.tostring(i_sl * i_tpMul),
+         style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+    shortMsg = '{"secret":"' + i_webhookSecret + '","direction":"SHORT","symbol":"' + syminfo.ticker +
+         '","entry":' + str.tostring(close) + ',"sl":' + str.tostring(close + i_sl) +
+         ',"tp":' + str.tostring(close - i_sl * i_tpMul) + '}'
+    alert(shortMsg, alert.freq_once_per_bar)
+
+if goLong
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Exit Long", "Long", stop = close - i_sl, limit = close + i_sl * i_tpMul)
+    tradedToday := true
+    label.new(bar_index, low, "LONG\nSL " + str.tostring(i_sl) + " / TP " + str.tostring(i_sl * i_tpMul),
+         style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+    longMsg = '{"secret":"' + i_webhookSecret + '","direction":"LONG","symbol":"' + syminfo.ticker +
+         '","entry":' + str.tostring(close) + ',"sl":' + str.tostring(close - i_sl) +
+         ',"tp":' + str.tostring(close + i_sl * i_tpMul) + '}'
+    alert(longMsg, alert.freq_once_per_bar)
+
+// =====================================================================================
+// PLOT DEBUG (opțional, pentru verificare rapidă în Data Window)
+// =====================================================================================
+plotshape(justBecameReady, title="Range Ready", style=shape.triangleup, location=location.belowbar,
+     color=color.orange, size=size.tiny)
